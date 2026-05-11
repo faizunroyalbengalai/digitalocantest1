@@ -1,0 +1,157 @@
+name: Deploy python to DigitalOcean Droplet
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision Droplet with Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.server_ip }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.DO_SPACES_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.DO_SPACES_BUCKET }}" \
+            -backend-config="region=${{ secrets.DO_SPACES_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="endpoint=https://${{ secrets.DO_SPACES_REGION }}.digitaloceanspaces.com" \
+            -backend-config="access_key=${{ secrets.DO_SPACES_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.DO_SPACES_SECRET_KEY }}"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="do_token=${{ secrets.DO_TOKEN }}" \
+            -var="region=${{ secrets.DO_REGION }}" \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}"
+
+      - name: Get Server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          SERVER_IP=$(terraform output -raw droplet_ip)
+          echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure Server with Ansible
+    runs-on: ubuntu-latest
+    needs: provision
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: |
+          pip install ansible
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Wait for SSH to become available
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Waiting for SSH on $SERVER_IP..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/id_rsa root@$SERVER_IP "echo ok" 2>/dev/null; then
+              echo "SSH is available."
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "SSH never became available."
+          exit 1
+
+      - name: Run Ansible Playbook
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          ansible-playbook \
+            -i "$SERVER_IP," \
+            -u root \
+            --private-key ~/.ssh/id_rsa \
+            -e "app_dir=/opt/app" \
+            -e "app_port=8000" \
+            -e "app_entrypoint=app.main:app" \
+            -e "python_version=3.11" \
+            -e "db_type=postgres" \
+            -e "do_token=${{ secrets.DO_TOKEN }}" \
+            ansible/playbook.yml
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Health check via SSH tunnel
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Running health check against http://$SERVER_IP/health"
+          for i in $(seq 1 12); do
+            RESPONSE=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/id_rsa root@$SERVER_IP \
+              "curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health" 2>/dev/null)
+            echo "Attempt $i: HTTP $RESPONSE"
+            if [ "$RESPONSE" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed after all attempts."
+          exit 1
+
+  notify:
+    name: Notify Deployment Result
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    steps:
+      - name: Report success
+        if: ${{ needs.verify.result == 'success' }}
+        run: |
+          echo "Deployment of python to DigitalOcean Droplet succeeded."
+          echo "Server IP: ${{ needs.provision.outputs.server_ip }}"
+          echo "Application is live at http://${{ needs.provision.outputs.server_ip }}/health"
+
+      - name: Report failure
+        if: ${{ needs.verify.result != 'success' }}
+        run: |
+          echo "Deployment of python to DigitalOcean Droplet FAILED."
+          echo "Server IP: ${{ needs.provision.outputs.server_ip }}"
+          echo "Check logs above for details."
+          exit 1

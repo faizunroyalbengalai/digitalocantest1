@@ -1,0 +1,257 @@
+---
+- name: Deploy python application
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    app_user: appuser
+    app_group: appuser
+    python_version: "3.11"
+    venv_dir: /opt/app/.venv
+    gunicorn_bin: /opt/app/.venv/bin/gunicorn
+    app_port: 8000
+    app_module: "app.main:app"
+
+  tasks:
+    - name: "Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "Install system dependencies"
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - git
+          - curl
+          - build-essential
+          - libpq-dev
+          - postgresql-client
+        state: present
+
+    - name: "Create application group"
+      group:
+        name: "{{ app_group }}"
+        state: present
+
+    - name: "Create application user"
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: yes
+        shell: /bin/bash
+        home: "{{ app_dir }}"
+        create_home: yes
+
+    - name: "Create application directory"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+
+    - name: "Copy application files to server"
+      synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.env"
+          - "--exclude=.venv"
+          - "--exclude=venv"
+          - "--exclude=node_modules"
+          - "--exclude=terraform"
+          - "--exclude=.terraform"
+          - "--exclude=*.tfstate"
+          - "--exclude=*.tfstate.backup"
+        delete: yes
+
+    - name: "Set ownership of application files"
+      file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: yes
+
+    - name: "Check if virtualenv already exists"
+      stat:
+        path: "{{ venv_dir }}/bin/activate"
+      register: venv_stat
+
+    - name: "Create Python virtual environment"
+      shell: python3.11 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: "Upgrade pip in virtualenv"
+      shell: "{{ venv_dir }}/bin/pip install --upgrade pip"
+      become_user: "{{ app_user }}"
+
+    - name: "Check if requirements.txt exists"
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: requirements_stat
+
+    - name: "Install Python dependencies from requirements.txt"
+      shell: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      become_user: "{{ app_user }}"
+      when: requirements_stat.stat.exists
+
+    - name: "Install gunicorn and uvicorn if not in requirements"
+      shell: "{{ venv_dir }}/bin/pip install gunicorn uvicorn[standard]"
+      become_user: "{{ app_user }}"
+
+    - name: "Install asyncpg and psycopg2 for postgres"
+      shell: "{{ venv_dir }}/bin/pip install psycopg2-binary asyncpg"
+      become_user: "{{ app_user }}"
+
+    - name: "Write .env file using printf"
+      shell: |
+        printf "DATABASE_URL=%s\nPORT=%s\nENV=%s\n" \
+          "${DATABASE_URL:-}" \
+          "${PORT:-8000}" \
+          "${APP_ENV:-production}" \
+          > {{ app_dir }}/.env
+      args:
+        executable: /bin/bash
+      environment:
+        DATABASE_URL: "{{ lookup('env', 'DATABASE_URL') | default('') }}"
+        PORT: "{{ lookup('env', 'PORT') | default('8000') }}"
+        APP_ENV: "{{ lookup('env', 'APP_ENV') | default('production') }}"
+
+    - name: "Set .env file permissions"
+      file:
+        path: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0600"
+
+    - name: "Create systemd service for application"
+      copy:
+        dest: /etc/systemd/system/app.service
+        content: |
+          [Unit]
+          Description=python FastAPI Application
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          Type=notify
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ gunicorn_bin }} app.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:{{ app_port }}
+          ExecReload=/bin/kill -s HUP $MAINPID
+          KillMode=mixed
+          TimeoutStopSec=5
+          PrivateTmp=true
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=app
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    - name: "Enable and start application service"
+      systemd:
+        name: app
+        enabled: yes
+        state: restarted
+
+    - name: "Write nginx configuration"
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+
+              client_max_body_size 20M;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_connect_timeout 60s;
+                  proxy_send_timeout 60s;
+                  proxy_read_timeout 60s;
+              }
+
+              location /health {
+                  proxy_pass http://127.0.0.1:{{ app_port }}/health;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  access_log off;
+              }
+          }
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Enable nginx site"
+      file:
+        src: /etc/nginx/sites-available/default
+        dest: /etc/nginx/sites-enabled/default
+        state: link
+      ignore_errors: yes
+
+    - name: "Test nginx configuration"
+      shell: nginx -t
+      changed_when: false
+
+    - name: "Enable and restart nginx"
+      systemd:
+        name: nginx
+        enabled: yes
+        state: restarted
+
+    - name: "Wait for application to be ready"
+      uri:
+        url: "http://localhost:{{ app_port }}/health"
+        method: GET
+        status_code: 200
+      register: health_check
+      until: health_check.status == 200
+      retries: 15
+      delay: 5
+      ignore_errors: yes
+
+    - name: "Show application health check result"
+      debug:
+        msg: "Application health check status: {{ health_check.status | default('unreachable') }}"
+
+    - name: "Show application service status"
+      shell: systemctl status app --no-pager -l
+      register: service_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Print service status"
+      debug:
+        msg: "{{ service_status.stdout_lines }}"
