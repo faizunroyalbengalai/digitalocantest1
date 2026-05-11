@@ -16,6 +16,7 @@ jobs:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.DO_SPACES_ACCESS_KEY }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.DO_SPACES_REGION }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
